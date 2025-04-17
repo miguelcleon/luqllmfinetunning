@@ -1,8 +1,9 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import datasets
+import psutil
 import argparse
 import json
 import os
@@ -12,14 +13,14 @@ import gc
 import time
 from typing import Optional, List, Dict, Any, Union
 #python gemma-3-4b-npu-training.py \
-#  --data_file training_datav2.json \
-#  --publications_file combined_publications.json \
+#  --data_files training_datav3.json_sections.json training_datav3.json_instruction.json training_datav3.json_basic.json \
+#  --publications_file papers_metadata.json \
 #  --output_dir gemma3_luq_model \
 #  --model_id google/gemma-3-4b-it \
 #  --format relationships \
-#  --use_npu \
+#  NO DONT USE --use_npu \
 #  --quantization int4 \
-#  --max_context 4096 \
+#  --max_context 1024 \
 #  --batch_size 1 \
 #  --gradient_accumulation_steps 16 \
 #  --epochs 3 \
@@ -66,7 +67,13 @@ def optimize_memory_usage():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Gemma-3-4b-it with NPU acceleration")
-    parser.add_argument("--data_file", type=str, required=True, help="Path to the training data JSON file")
+    parser.add_argument(
+        "--data_files",
+        type=str,
+        nargs='+',
+        required=True,
+        help="One or more paths to training data JSON files"
+    )
     parser.add_argument("--publications_file", type=str, help="Path to the combined publications JSON file (optional)")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for the fine-tuned model")
     parser.add_argument("--model_id", type=str, default="google/gemma-3-4b-it", help="Base model ID")
@@ -91,75 +98,85 @@ def parse_args():
     return parser.parse_args()
 
 
-def prepare_instruction_dataset(data_file, tokenizer, max_length=4096, format_type="relationships"):
-    """Prepare a dataset in the appropriate format for fine-tuning."""
-    logger.info(f"Loading and formatting dataset in {format_type} format...")
-
-    # Load the JSON file
-    with open(data_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    # Check if it's already in datasets format
-    if isinstance(data, dict) and "train" in data:
-        raw_dataset = datasets.Dataset.from_dict(data["train"])
-    else:
-        raw_dataset = datasets.Dataset.from_list(data)
-
-    # Format based on data type
+def prepare_instruction_dataset(data_files: List[str], tokenizer, max_length=4096, format_type="relationships"):
+    """Load, merge, format, and tokenize one or more JSON training files."""
+    print(f"→ Loading & formatting {len(data_files)} file(s) in '{format_type}' format…")
     formatted_examples = []
 
-    for item in raw_dataset:
-        try:
-            # Handle instruction format (most common for relationships format)
-            if "instruction" in item and "output" in item:
-                instruction = item["instruction"]
-                input_text = item.get("input", "")
-                output = item["output"]
+    for file_path in data_files:
+        print(f"   • Reading {file_path} …", end='')
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # handle either `{ "train": [...] }` or a flat list
+        raw_list = data.get("train", data) if isinstance(data, dict) else data
+        print(f" {len(raw_list)} items")
 
-                if input_text:
-                    prompt = f"<start_of_turn>user\n{instruction}\n\n{input_text}<end_of_turn>\n<start_of_turn>model\n{output}<end_of_turn>"
-                else:
-                    prompt = f"<start_of_turn>user\n{instruction}<end_of_turn>\n<start_of_turn>model\n{output}<end_of_turn>"
+        for item in raw_list:
+            try:
+                # Instruction/relationship format
+                if "instruction" in item and "output" in item:
+                    instr = item["instruction"]
+                    inp   = item.get("input", "")
+                    out   = item["output"]
+                    if inp:
+                        prompt = (
+                            "<start_of_turn>user\n"
+                            f"{instr}\n\n{inp}<end_of_turn>\n"
+                            "<start_of_turn>model\n"
+                            f"{out}<end_of_turn>"
+                        )
+                    else:
+                        prompt = (
+                            "<start_of_turn>user\n"
+                            f"{instr}<end_of_turn>\n"
+                            "<start_of_turn>model\n"
+                            f"{out}<end_of_turn>"
+                        )
+                    formatted_examples.append({"text": prompt})
 
-                formatted_examples.append({"text": prompt})
+                # Sections format
+                elif "text" in item and ("<section" in item["text"] or "<title>" in item["text"]):
+                    txt = item["text"]
+                    title_match = re.search(r'<title>(.*?)</title>', txt)
+                    title = title_match.group(1) if title_match else "this research paper"
+                    prompt = (
+                        "<start_of_turn>user\n"
+                        f"Please analyze the following research paper: {title}<end_of_turn>\n"
+                        "<start_of_turn>model\n"
+                        f"{txt}<end_of_turn>"
+                    )
+                    formatted_examples.append({"text": prompt})
 
-            # Handle sections format
-            elif "text" in item and ("<section" in item["text"] or "<title>" in item["text"]):
-                text = item["text"]
-                title_match = re.search(r'<title>(.*?)</title>', text)
-                title = title_match.group(1) if title_match else "this research paper"
+                # Basic text-only format
+                elif "text" in item:
+                    prompt = (
+                        "<start_of_turn>user\n"
+                        "Please analyze this research content<end_of_turn>\n"
+                        "<start_of_turn>model\n"
+                        f"{item['text']}<end_of_turn>"
+                    )
+                    formatted_examples.append({"text": prompt})
 
-                prompt = f"<start_of_turn>user\nPlease analyze the following research paper: {title}<end_of_turn>\n<start_of_turn>model\n{text}<end_of_turn>"
-                formatted_examples.append({"text": prompt})
+            except Exception as e:
+                logger.warning(f"Error formatting an example from {file_path}: {e}")
+                continue
 
-            # Handle basic format
-            elif "text" in item:
-                # Wrap in Gemma-3 conversation format
-                prompt = f"<start_of_turn>user\nPlease analyze this research content<end_of_turn>\n<start_of_turn>model\n{item['text']}<end_of_turn>"
-                formatted_examples.append({"text": prompt})
-        except Exception as e:
-            logger.warning(f"Error formatting example: {e}")
-            continue
-
-    # Create a dataset
-    logger.info(f"Created {len(formatted_examples)} formatted examples")
+    print(f"→ Formatted a total of {len(formatted_examples)} examples")
     dataset = datasets.Dataset.from_list(formatted_examples)
 
-    # Tokenize the dataset
-    logger.info(f"Tokenizing dataset with max_length={max_length}...")
+    # Tokenize
+    print(f"→ Tokenizing with max_length={max_length} …")
+    def tokenize_fn(exs):
+        return tokenizer(exs["text"], truncation=True, max_length=max_length)
 
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=max_length)
-
-    tokenized_dataset = dataset.map(
-        tokenize_function,
+    tokenized = dataset.map(
+        tokenize_fn,
         batched=True,
         remove_columns=["text"],
-        desc="Tokenizing dataset"
+        desc="Tokenizing"
     )
-
-    logger.info(f"Tokenized dataset with {len(tokenized_dataset)} examples")
-    return tokenized_dataset
+    print(f"→ Tokenization complete: {len(tokenized)} examples ready")
+    return tokenized
 
 
 def load_and_prepare_model(model_id, use_npu, quantization, max_context, lora_rank, lora_alpha, lora_dropout):
@@ -209,13 +226,36 @@ def load_and_prepare_model(model_id, use_npu, quantization, max_context, lora_ra
     }
 
     # Add context length limitation to save memory
-    if max_context < 128000:  # Gemma-3-4b supports up to 128K context
-        model_kwargs["max_position_embeddings"] = max_context
 
     try:
+        print(f"→ Loading base model config for {model_id} …")
+        config = AutoConfig.from_pretrained(model_id)
+        # override the positional embeddings size:
+        if max_context < getattr(config, "max_position_embeddings", max_context):
+            print(f"→ Overriding config.max_position_embeddings: {config.max_position_embeddings} → {max_context}")
+            config.max_position_embeddings = max_context
+
+        print(f"→ Loading model {model_id} with custom config …")
+        gpu_total = torch.cuda.get_device_properties(0).total_memory // (1024 ** 3)
+        gpu_allowed = f"{int(gpu_total * 0.9)}GB"
+
+        # how much system RAM you have
+
+        gpu_gb = torch.cuda.get_device_properties(0).total_memory // (1024 ** 3)
+        ram_gb = psutil.virtual_memory().total // (1024 ** 3)
+        max_mem = {
+            0: f"{int(gpu_gb * 0.8)}GB",  # e.g. allow 80% of your GPU
+            "cpu": f"{int(ram_gb * 0.9)}GB"
+        }
+
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            **model_kwargs
+            config=config,
+            quantization_config=bnb_config,
+            device_map="auto",
+            max_memory=max_mem,
+            torch_dtype=torch.float16,
+            attn_implementation="eager",
         )
     except Exception as e:
         logger.error(f"Error loading model: {e}")
@@ -278,12 +318,13 @@ def main():
 
     # Prepare the dataset
     tokenized_dataset = prepare_instruction_dataset(
-        args.data_file,
+        args.data_files,
         tokenizer,
         max_length=args.max_context,
         format_type=args.format
     )
-
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False  # make sure caching is off
     # Set up training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -298,6 +339,7 @@ def main():
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=3,
+        gradient_checkpointing=True,
         fp16=True,
         optim="paged_adamw_8bit",
         report_to="none",
@@ -312,6 +354,7 @@ def main():
         args=training_args,
         train_dataset=tokenized_dataset,
         data_collator=data_collator,
+        label_names=["labels"],
     )
 
     # Start training
