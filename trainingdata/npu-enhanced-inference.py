@@ -8,11 +8,11 @@ import re
 import logging
 # python npu-enhanced-inference.py \
 #  --model_path luq_lter_model_npu/final_model \
-#  --base_model google/gemma-7b \
+#  --base_model google/gemma-3-4b-it \
 #  --publications_file combined_publications.json \
 #  --use_npu \
-#  --quantization int8 \
-#  --max_length 512 \
+#  --quantization int4  \
+#  --max_length 4096 \
 #  --temperature 0.7 \
 #  --interactive
 # Set up logging
