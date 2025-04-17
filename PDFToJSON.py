@@ -2,220 +2,10 @@
 # C:\one\OneDrive - USNH\LUQ-LTER-Share\publications
 # /mnt/c/one/OneDrive - USNH/LUQ-LTER-Share/publications
 # /mnt/c/one/OneDrive - USNH/LUQ-LTER-Share/Zotero
-
-import os
-import json
-import argparse
-import subprocess
-import shutil
-import re
-from tqdm import tqdm
-
-
-def setup_environment():
-    """Install required packages for the workflow."""
-    packages = [
-        "torch",
-        "transformers",
-        "datasets",
-        "accelerate",
-        "peft",
-        "trl",
-        "PyPDF2",
-        "PyMuPDF",
-        "nltk",
-        "scikit-learn",
-        "tqdm"
-    ]
-
-    print("Setting up environment...")
-    for package in tqdm(packages):
-        subprocess.run(["pip", "install", "-q", package], check=True)
-
-    print("Environment setup complete.")
-
-
-def validate_dataset(dataset_path, min_entries=10, min_tokens=1000):
-    """Validate the dataset to ensure it's suitable for training."""
-    try:
-        with open(dataset_path, 'r', encoding='utf-8') as f:
-            dataset = json.load(f)
-
-        if len(dataset) < min_entries:
-            print(f"Warning: Dataset has only {len(dataset)} entries. Recommended: at least {min_entries}.")
-            return False
-
-        # Check token counts (approximate)
-        short_entries = 0
-        for entry in dataset:
-            text = entry.get("text", "")
-            # Rough approximation of token count (words / 0.75)
-            token_count = len(text.split()) / 0.75
-            if token_count < min_tokens:
-                short_entries += 1
-
-        if short_entries > len(dataset) * 0.2:  # More than 20% are short
-            print(
-                f"Warning: {short_entries} entries ({short_entries / len(dataset) * 100:.1f}%) are shorter than recommended.")
-            return False
-
-        print(f"Dataset validation passed: {len(dataset)} entries")
-        return True
-
-    except Exception as e:
-        print(f"Error validating dataset: {e}")
-        return False
-
-
-def prepare_training_script(dataset_path, output_dir, model_id="google/gemma-7b", epochs=3):
-    """Create a training script for fine-tuning Gemma."""
-    # Create the training script content with proper formatting
-    script = '''
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
-from peft import LoraConfig, get_peft_model
-import datasets
-
-# Load dataset
-dataset = datasets.load_dataset("json", data_files="{0}")
-print(f"Dataset loaded with {{len(dataset['train'])}} examples")
-
-# Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained("{1}")
-tokenizer.pad_token = tokenizer.eos_token
-
-# Configure quantization
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16
-)
-
-# Load model
-model = AutoModelForCausalLM.from_pretrained(
-    "{1}",
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-
-# Configure LoRA
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
-)
-
-# Apply LoRA to model
-peft_model = get_peft_model(model, lora_config)
-print("Model prepared with LoRA")
-
-# Tokenize the dataset
-def tokenize_function(examples):
-    return tokenizer(examples["text"], truncation=True, max_length=2048)
-
-tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-print("Dataset tokenized")
-
-# Set up training arguments
-training_args = TrainingArguments(
-    output_dir="{2}",
-    num_train_epochs={3},
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=2,
-    learning_rate=2e-4,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
-    weight_decay=0.01,
-    logging_steps=10,
-    save_strategy="epoch",
-    save_total_limit=3,
-    fp16=True,
-    optim="paged_adamw_8bit",
-    report_to="none",
-)
-
-# Initialize the trainer
-trainer = Trainer(
-    model=peft_model,
-    args=training_args,
-    train_dataset=tokenized_dataset["train"],
-    data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-)
-
-# Start training
-print("Starting training...")
-trainer.train()
-
-# Save the fine-tuned model
-peft_model.save_pretrained("{2}/final_model")
-tokenizer.save_pretrained("{2}/final_model")
-print(f"Training complete. Model saved to {2}/final_model")
-'''.format(dataset_path, model_id, output_dir, epochs)
-
-    # Save the script
-    script_path = os.path.join(output_dir, "train_gemma.py")
-    os.makedirs(output_dir, exist_ok=True)
-
-    with open(script_path, 'w', encoding='utf-8') as f:
-        f.write(script)
-
-    print(f"Training script created at {script_path}")
-    return script_path
-
-
-def prepare_inference_script(model_dir):
-    """Create an inference script for testing the fine-tuned model."""
-    script = '''
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
-# Load the fine-tuned model
-model_path = "{0}/final_model"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto")
-
-# Create a text generation pipeline
-generator = pipeline("text-generation", model=model, tokenizer=tokenizer)
-
-# Function to generate text
-def generate_text(prompt, max_length=500):
-    result = generator(prompt, max_length=max_length, num_return_sequences=1)
-    return result[0]['generated_text']
-
-# Interactive loop
-print("\\nFine-tuned Gemma Model - Test Interface")
-print("Enter 'q' or 'quit' to exit")
-print("-" * 50)
-
-while True:
-    prompt = input("\\nEnter a prompt: ")
-
-    if prompt.lower() in ['q', 'quit', 'exit']:
-        break
-
-    generated = generate_text(prompt)
-    print("\\nGenerated text:")
-    print("-" * 50)
-    print(generated)
-    print("-" * 50)
-'''.format(model_dir)
-
-    # Save the script
-    script_path = os.path.join(model_dir, "inference.py")
-
-    with open(script_path, 'w', encoding='utf-8') as f:
-        f.write(script)
-
-    print(f"Inference script created at {script_path}")
-    return script_path
-
-
-def create_pdf_processor_script(output_dir):
-    """Create a PDF processor script that handles recursive directory processing."""
-    script = '''
+# python enhanced_pdf_processor.py --input /folder1 /folder2 /folder3
+# --output combined_publications.json
+# --metadata --sections --training_output training_data.json --format relationships
+# python PDFToJSON.py --input /mnt/c/one/OneDrive - USNH/LUQ-LTER-Share/publications /mnt/c/one/OneDrive - USNH/LUQ-LTER-Share/Zotero --output combined_publications.json --metadata --sections --training_output training_datav2.json --format relationships
 import os
 import re
 import json
@@ -224,6 +14,9 @@ from tqdm import tqdm
 import fitz  # PyMuPDF
 import nltk
 from nltk.tokenize import sent_tokenize
+from collections import defaultdict
+import hashlib
+import string
 
 # Download NLTK resources if not already downloaded
 try:
@@ -232,32 +25,95 @@ except LookupError:
     nltk.download('punkt')
 
 
+def extract_authors(text):
+    """Extract author names from the paper."""
+    # Try to find author list after title or before abstract
+    author_patterns = [
+        # Pattern for author list with affiliations
+        r'(?:^|\n)(?!Abstract|Introduction|Keywords)([A-Z][a-zA-Z\-\s,\.]+(?:,|\sand\s|\s&\s)[A-Z][a-zA-Z\-\s,\.]+)(?=\n\s*\d|\n\s*\w+@|\n\s*Abstract|\n\s*\()',
+        # Pattern for simple comma-separated author list
+        r'(?<=\n)([A-Z][a-zA-Z\-\s]+(?:,\s*[A-Z][a-zA-Z\-\s]+)+)(?=\n)',
+        # Pattern for authors with numbers for affiliations
+        r'([A-Z][a-zA-Z\-\s]+(?:\s*\d+\s*,\s*[A-Z][a-zA-Z\-\s]+\s*\d+)+)',
+    ]
+
+    for pattern in author_patterns:
+        author_match = re.search(pattern, text[:1000], re.MULTILINE)
+        if author_match:
+            authors_text = author_match.group(1).strip()
+            # Clean up and split the author string
+            authors_text = re.sub(r'\d+', '', authors_text)  # Remove numbers
+            authors_text = re.sub(r'\([^)]*\)', '', authors_text)  # Remove parentheses
+
+            # Split by common author separators
+            if ',' in authors_text:
+                authors = [a.strip() for a in authors_text.split(',')]
+            elif ' and ' in authors_text:
+                parts = authors_text.split(' and ')
+                authors = []
+                for part in parts:
+                    if ',' in part:
+                        authors.extend([a.strip() for a in part.split(',')])
+                    else:
+                        authors.append(part.strip())
+            else:
+                authors = [authors_text]
+
+            # Clean authors list
+            authors = [a for a in authors if a and len(a) > 1 and not a.isdigit()]
+            return authors
+
+    return []
+
+
 def extract_metadata(pdf_path):
     """Extract metadata from PDF."""
     try:
         doc = fitz.open(pdf_path)
         metadata = doc.metadata
 
-        # Extract title from the first page if not in metadata
-        if not metadata.get('title'):
-            first_page = doc[0]
-            text = first_page.get_text()
-            # Simple heuristic: first line might be the title
-            lines = text.strip().split('\\n')
-            if lines and len(lines[0]) < 200:  # Reasonable title length
-                metadata['title'] = lines[0].strip()
+        first_page_text = doc[0].get_text()
+
+        # Extract title from the first page if not in metadata or if it's generic
+        if not metadata.get('title') or metadata.get('title') in ['Microsoft Word', 'Untitled', '']:
+            # Simple heuristic: look for the first substantial line
+            lines = first_page_text.strip().split('\n')
+            for line in lines[:10]:  # Check first 10 lines
+                line = line.strip()
+                if line and len(line) > 10 and len(line) < 200 and not re.match(r'^\d', line):
+                    # Likely a title if it's reasonably sized and doesn't start with a number
+                    metadata['title'] = line
+                    break
+
+        # Extract authors
+        authors = extract_authors(first_page_text)
+        if authors:
+            metadata['authors'] = authors
 
         # Try to extract abstract
         abstract = ""
         for page in doc[:2]:  # Check first two pages
             text = page.get_text()
-            abstract_match = re.search(r'Abstract[:\\.\s]+(.*?)(?:\\n\\n|\\nIntroduction|\\n1\\.)', 
-                                      text, re.DOTALL | re.IGNORECASE)
+            abstract_match = re.search(
+                r'(?:Abstract|ABSTRACT)[:\.\s]+(.*?)(?:\n\n|\n(?:Introduction|INTRODUCTION|Keywords|KEYWORDS|1\.))',
+                text, re.DOTALL | re.IGNORECASE)
             if abstract_match:
                 abstract = abstract_match.group(1).strip()
                 break
 
         metadata['abstract'] = abstract
+
+        # Try to extract DOI
+        doi_pattern = r'(?:DOI|doi)[\s:]*([0-9\.]+\/[a-zA-Z0-9\.\-_\/]+)'
+        doi_match = re.search(doi_pattern, first_page_text)
+        if doi_match:
+            metadata['doi'] = doi_match.group(1).strip()
+
+        # Try to extract publication year
+        year_pattern = r'(?:©|\(c\)|\(C\)|Copyright|\b)[\s]*([12][0-9]{3})(?:\b|,)'
+        year_match = re.search(year_pattern, first_page_text)
+        if year_match:
+            metadata['year'] = year_match.group(1).strip()
 
         doc.close()
         return metadata
@@ -267,31 +123,57 @@ def extract_metadata(pdf_path):
 
 
 def segment_paper(text):
-    """Segment paper into sections."""
+    """Segment paper into sections with improved detection."""
     sections = {}
 
-    # Try to identify common section headers
-    section_pattern = re.compile(r'\\n(\\d+\\.?\\s+[A-Z][a-zA-Z\\s]+|\\b(?:Abstract|Introduction|Methods|Results|Discussion|Conclusion|References)\\b)[:\\.\s\\n]+', re.IGNORECASE)
+    # Define common section headers with variations
+    section_headers = [
+        'Abstract', 'ABSTRACT',
+        'Introduction', 'INTRODUCTION',
+        'Background', 'BACKGROUND',
+        'Literature Review', 'LITERATURE REVIEW',
+        'Related Work', 'RELATED WORK',
+        'Materials and Methods', 'MATERIALS AND METHODS', 'Methods', 'METHODS', 'Methodology', 'METHODOLOGY',
+        'Experimental Setup', 'EXPERIMENTAL SETUP', 'Experiments', 'EXPERIMENTS',
+        'Results', 'RESULTS',
+        'Discussion', 'DISCUSSION',
+        'Results and Discussion', 'RESULTS AND DISCUSSION',
+        'Conclusion', 'CONCLUSION', 'Conclusions', 'CONCLUSIONS',
+        'Acknowledgment', 'ACKNOWLEDGMENT', 'Acknowledgments', 'ACKNOWLEDGMENTS', 'Acknowledgements',
+        'ACKNOWLEDGEMENTS',
+        'References', 'REFERENCES', 'Bibliography', 'BIBLIOGRAPHY',
+        'Appendix', 'APPENDIX', 'Appendices', 'APPENDICES'
+    ]
 
-    matches = list(section_pattern.finditer(text))
+    # Create pattern for numbered sections and standard headers
+    numbered_section_pattern = r'\n(?:(\d+\.(?:\d+)*)\s+([A-Z][a-zA-Z\s]+)|({}))(?:[:\.\s\n]+)'.format(
+        '|'.join(section_headers))
+
+    # Find all section headers
+    matches = list(re.finditer(numbered_section_pattern, text, re.MULTILINE))
 
     if not matches:
         # If no sections found, return the whole text as "body"
         return {"body": text}
 
-    # Extract each section
+    # Process each section
     for i, match in enumerate(matches):
-        section_name = match.group(1).strip()
+        section_number = match.group(1) if match.group(1) else ""
+        section_name = match.group(2) if match.group(2) else match.group(3)
+
+        # Full section name with number if applicable
+        full_section_name = f"{section_number} {section_name}" if section_number else section_name
+
         start_pos = match.end()
 
         # Get end position (start of next section or end of text)
         if i < len(matches) - 1:
-            end_pos = matches[i+1].start()
+            end_pos = matches[i + 1].start()
         else:
             end_pos = len(text)
 
         section_text = text[start_pos:end_pos].strip()
-        sections[section_name] = section_text
+        sections[full_section_name] = section_text
 
     return sections
 
@@ -299,32 +181,49 @@ def segment_paper(text):
 def clean_text(text):
     """Clean extracted text for better quality."""
     # Replace multiple newlines with a single newline
-    text = re.sub(r'\\n{3,}', '\\n\\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
 
     # Replace multiple spaces with a single space
     text = re.sub(r' +', ' ', text)
 
     # Remove page numbers
-    text = re.sub(r'\\n\\s*\\d+\\s*\\n', '\\n', text)
+    text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
 
     # Remove form feed characters
-    text = re.sub(r'\\f', '', text)
+    text = re.sub(r'\f', '', text)
 
     # Fix hyphenated words at line breaks
-    text = re.sub(r'(\\w+)-\\n(\\w+)', r'\\1\\2', text)
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
 
     # Handle common PDF artifacts
-    text = re.sub(r'\\(cid:\\d+\\)', '', text)
+    text = re.sub(r'\(cid:\d+\)', '', text)
 
     # Fix spacing after periods
-    text = re.sub(r'\\.([A-Z])', r'. \\1', text)
+    text = re.sub(r'\.([A-Z])', r'. \1', text)
 
     # Clean up citations
-    text = re.sub(r'\\[\\d+(?:,\\s*\\d+)*\\]', '', text)
-    text = re.sub(r'\\(\\w+ et al\\.,? \\d{4}[a-z]?\\)', '', text)
+    text = re.sub(r'\[\d+(?:,\s*\d+)*\]', '', text)
+    text = re.sub(r'\(\w+ et al\.,? \d{4}[a-z]?\)', '', text)
 
     # Remove URLs
-    text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\\\(\\\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+    text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+
+    # Clean up headers/footers (often contains journal names, dates, page numbers)
+    lines = text.split('\n')
+    if len(lines) > 10:
+        # Check for repeating headers/footers
+        header_candidates = set(lines[:5])
+        footer_candidates = set(lines[-5:])
+
+        # Remove lines that appear in both header and body sections
+        filtered_lines = []
+        for i, line in enumerate(lines):
+            if ((line in header_candidates and i > 5) or
+                    (line in footer_candidates and i < len(lines) - 5) or
+                    not any(line == x for x in lines if x != line)):
+                filtered_lines.append(line)
+
+        text = '\n'.join(filtered_lines)
 
     # Strip leading/trailing whitespace
     text = text.strip()
@@ -337,13 +236,13 @@ def process_pdf(pdf_path, include_metadata=True, include_sections=True):
     try:
         # Basic text extraction with PyMuPDF
         doc = fitz.open(pdf_path)
-        text = ""
+        full_text = ""
         for page in doc:
-            text += page.get_text() + "\\n"
+            full_text += page.get_text() + "\n"
         doc.close()
 
         # Clean the text
-        text = clean_text(text)
+        clean_full_text = clean_text(full_text)
 
         # Extract metadata if requested
         metadata = {}
@@ -353,13 +252,17 @@ def process_pdf(pdf_path, include_metadata=True, include_sections=True):
         # Segment into sections if requested
         sections = {}
         if include_sections:
-            sections = segment_paper(text)
+            sections = segment_paper(clean_full_text)
+
+        # Create unique ID for document based on content
+        content_hash = hashlib.md5(clean_full_text.encode()).hexdigest()[:12]
 
         # Create document entry
         document = {
-            "text": text,
+            "id": content_hash,
+            "text": clean_full_text,
             "source": pdf_path,
-            "length": len(text)
+            "length": len(clean_full_text)
         }
 
         # Add metadata if available
@@ -375,6 +278,70 @@ def process_pdf(pdf_path, include_metadata=True, include_sections=True):
     except Exception as e:
         print(f"Error processing {pdf_path}: {e}")
         return None
+
+
+def normalize_author_name(name):
+    """Normalize author names for consistent matching."""
+    # Convert to lowercase and remove punctuation
+    name = name.lower()
+    name = name.translate(str.maketrans('', '', string.punctuation))
+
+    # Handle common name formats
+    parts = name.split()
+    if len(parts) >= 2:
+        # Try to handle lastname, firstname format
+        if ',' in name:
+            lastname_first_parts = name.split(',')
+            if len(lastname_first_parts) >= 2:
+                lastname = lastname_first_parts[0].strip()
+                firstname = lastname_first_parts[1].strip()
+                # Use only first initial if available
+                if firstname:
+                    firstname_initial = firstname[0]
+                    return f"{lastname} {firstname_initial}"
+
+        # Handle firstname lastname format - get last part as surname, first initial
+        lastname = parts[-1]
+        firstname_initial = parts[0][0]
+        return f"{lastname} {firstname_initial}"
+
+    return name
+
+
+def build_author_relationships(documents):
+    """Build a graph of author relationships from documents."""
+    author_papers = defaultdict(list)
+    paper_authors = {}
+
+    # Build author-paper relationships
+    for doc in documents:
+        if "metadata" in doc and "authors" in doc["metadata"]:
+            authors = doc["metadata"]["authors"]
+            normalized_authors = [normalize_author_name(author) for author in authors]
+
+            # Store the mapping
+            paper_id = doc["id"]
+            paper_authors[paper_id] = normalized_authors
+
+            # Add paper to each author's list
+            for author in normalized_authors:
+                author_papers[author].append(paper_id)
+
+    # Build co-authorship graph
+    coauthor_graph = defaultdict(set)
+
+    for paper_id, authors in paper_authors.items():
+        for author in authors:
+            # Each author is connected to all other authors of the same paper
+            for coauthor in authors:
+                if author != coauthor:
+                    coauthor_graph[author].add(coauthor)
+
+    return {
+        "author_papers": dict(author_papers),
+        "paper_authors": paper_authors,
+        "coauthor_graph": {author: list(coauthors) for author, coauthors in coauthor_graph.items()}
+    }
 
 
 def find_pdf_files(dir_path):
@@ -396,7 +363,7 @@ def find_pdf_files(dir_path):
 
 
 def process_directory(dir_path, output_file, min_length=500, include_metadata=True, include_sections=True):
-    """Process all PDFs in a directory and save as a JSON file."""
+    """Process all PDFs in a directory and save as a JSON file with author relationships."""
     # Find all PDF files recursively
     pdf_files = find_pdf_files(dir_path)
 
@@ -406,45 +373,62 @@ def process_directory(dir_path, output_file, min_length=500, include_metadata=Tr
 
     # Process each PDF
     print(f"Processing {len(pdf_files)} PDF files...")
-    dataset = []
+    documents = []
 
     for pdf_file in tqdm(pdf_files):
         document = process_pdf(pdf_file, include_metadata, include_sections)
 
         if document and document.get("text") and len(document["text"]) >= min_length:
-            dataset.append(document)
+            documents.append(document)
         else:
             print(f"Skipping {pdf_file}: Text too short or extraction failed")
 
-    if not dataset:
+    if not documents:
         print("No valid documents were processed.")
         return []
+
+    # Build author relationships
+    author_relationships = build_author_relationships(documents)
+
+    # Combine documents and relationships
+    dataset = {
+        "documents": documents,
+        "author_relationships": author_relationships
+    }
 
     # Save as JSON
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
 
-    print(f"Processed {len(dataset)} PDFs successfully out of {len(pdf_files)} total")
+    print(f"Processed {len(documents)} PDFs successfully out of {len(pdf_files)} total")
     print(f"Output saved to {output_file}")
 
-    return dataset
+    return documents
 
 
-def create_training_json(input_json, output_json, format_type="basic"):
+def create_training_json(input_json, output_json, format_type="sections"):
     """
-    Convert processed JSON to training format.
+    Convert processed JSON to training format with enhanced section awareness.
 
     format_type options:
     - "basic": Simple text entries
     - "instruction": Q&A format for instruction tuning
-    - "sections": Section-based format
+    - "sections": Section-based format with enhanced structure
+    - "relationships": Include author relationship information in prompts
     """
     try:
         with open(input_json, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        if not data:
-            print(f"Warning: Input JSON file {input_json} is empty.")
+        documents = data.get("documents", [])
+        if not documents and isinstance(data, list):
+            # Handle legacy format where it's just a list of documents
+            documents = data
+
+        author_relationships = data.get("author_relationships", {})
+
+        if not documents:
+            print(f"Warning: Input JSON file {input_json} is empty or has no documents.")
             return []
     except Exception as e:
         print(f"Error reading input JSON {input_json}: {e}")
@@ -452,50 +436,201 @@ def create_training_json(input_json, output_json, format_type="basic"):
 
     training_data = []
 
-    for item in data:
+    for doc in documents:
+        doc_id = doc.get("id", "")
+        metadata = doc.get("metadata", {})
+        title = metadata.get("title", "")
+        authors = metadata.get("authors", [])
+        abstract = metadata.get("abstract", "")
+        sections = doc.get("sections", {})
+        full_text = doc.get("text", "")
+
         if format_type == "basic":
             # Simple format with just text
-            training_data.append({"text": item["text"]})
+            training_data.append({"text": full_text})
 
         elif format_type == "instruction":
-            # Instruction tuning format
-            # Extract abstract as question, rest as answer if available
-            if "metadata" in item and "abstract" in item["metadata"] and item["metadata"]["abstract"]:
-                abstract = item["metadata"]["abstract"]
-                # Create Q&A pairs from abstract and content
+            # Instruction tuning format with enhanced Q&A pairs
+
+            # First, include the main document summary task
+            if title and abstract:
+                training_data.append({
+                    "instruction": f"Summarize the paper titled '{title}' with the abstract: {abstract}",
+                    "input": "",
+                    "output": full_text
+                })
+            elif title:
+                training_data.append({
+                    "instruction": f"Summarize the paper titled '{title}'",
+                    "input": "",
+                    "output": full_text
+                })
+            elif abstract:
                 training_data.append({
                     "instruction": f"Explain the following research abstract in detail: {abstract}",
                     "input": "",
-                    "output": item["text"]
+                    "output": full_text
                 })
-
-                # Add more instruction examples if paper has sections
-                if "sections" in item:
-                    for section_name, section_text in item["sections"].items():
-                        if section_name.lower() not in ["abstract", "references"]:
-                            training_data.append({
-                                "instruction": f"What does the paper say about {section_name}?",
-                                "input": abstract,
-                                "output": section_text
-                            })
             else:
-                # Fallback if no abstract
                 training_data.append({
                     "instruction": "Summarize this research paper",
                     "input": "",
-                    "output": item["text"]
+                    "output": full_text
                 })
 
+            # Add section-specific Q&A pairs
+            if sections:
+                for section_name, section_text in sections.items():
+                    if section_name.lower() not in ["abstract", "references", "bibliography", "acknowledgments",
+                                                    "appendix"]:
+                        training_data.append({
+                            "instruction": f"In the paper {title if title else 'about this research'}, what does the section '{section_name}' discuss?",
+                            "input": abstract if abstract else "",
+                            "output": section_text
+                        })
+
+                        # Add some specific question types based on section
+                        if "method" in section_name.lower() or "methodology" in section_name.lower():
+                            training_data.append({
+                                "instruction": f"What methods were used in the research '{title if title else 'described in this paper'}'?",
+                                "input": abstract if abstract else "",
+                                "output": section_text
+                            })
+
+                        if "result" in section_name.lower():
+                            training_data.append({
+                                "instruction": f"What were the main results of the study '{title if title else 'in this paper'}'?",
+                                "input": abstract if abstract else "",
+                                "output": section_text
+                            })
+
+                        if "discussion" in section_name.lower() or "conclusion" in section_name.lower():
+                            training_data.append({
+                                "instruction": f"What are the main conclusions of the paper '{title if title else 'on this research'}'?",
+                                "input": abstract if abstract else "",
+                                "output": section_text
+                            })
+
         elif format_type == "sections":
-            # Format with sections as separate entries
-            if "sections" in item:
-                for section_name, section_text in item["sections"].items():
+            # Enhanced format with section markers for better structure awareness
+
+            # Create a structured document with metadata and sections
+            document_parts = []
+
+            # Add metadata header
+            if title:
+                document_parts.append(f"<title>{title}</title>")
+
+            if authors:
+                document_parts.append(f"<authors>{', '.join(authors)}</authors>")
+
+            if abstract:
+                document_parts.append(f"<abstract>{abstract}</abstract>")
+
+            # Add each section with proper tags
+            if sections:
+                for section_name, section_text in sections.items():
+                    # Skip empty sections
+                    if not section_text or len(section_text.strip()) < 50:
+                        continue
+
+                    # Clean section name for tag
+                    clean_section_name = section_name.lower().replace(' ', '_')
+                    document_parts.append(f"<section name=\"{section_name}\">{section_text}</section>")
+            else:
+                # If no sections available, add the full text
+                document_parts.append(f"<body>{full_text}</body>")
+
+            # Combine all parts into one structured document
+            structured_document = "\n\n".join(document_parts)
+            training_data.append({"text": structured_document})
+
+        elif format_type == "relationships":
+            # Format that includes author relationship information
+
+            # Get coauthors for the authors of this paper
+            paper_author_info = []
+            if authors and doc_id in author_relationships.get("paper_authors", {}):
+                norm_authors = author_relationships["paper_authors"][doc_id]
+
+                # For each author, find their other papers and coauthors
+                for i, author in enumerate(authors):
+                    if i >= len(norm_authors):
+                        continue
+
+                    norm_author = norm_authors[i]
+
+                    # Get other papers by this author
+                    other_papers = []
+                    if norm_author in author_relationships.get("author_papers", {}):
+                        paper_ids = author_relationships["author_papers"][norm_author]
+                        # Find titles of other papers
+                        for paper_id in paper_ids:
+                            if paper_id != doc_id:  # Skip current paper
+                                for other_doc in documents:
+                                    if other_doc.get("id") == paper_id and "metadata" in other_doc:
+                                        other_title = other_doc["metadata"].get("title", "")
+                                        if other_title:
+                                            other_papers.append(other_title)
+
+                    # Get coauthors
+                    coauthors = []
+                    if norm_author in author_relationships.get("coauthor_graph", {}):
+                        norm_coauthors = author_relationships["coauthor_graph"][norm_author]
+                        # Map back to original author names where possible
+                        for norm_coauthor in norm_coauthors:
+                            for other_author in authors:
+                                if normalize_author_name(
+                                        other_author) == norm_coauthor and other_author not in coauthors:
+                                    coauthors.append(other_author)
+
+                    # Add author info
+                    author_info = {
+                        "name": author,
+                        "other_papers": other_papers[:5],  # Limit to 5 papers
+                        "coauthors": coauthors
+                    }
+                    paper_author_info.append(author_info)
+
+            # Create training examples with relationship info
+            if title and abstract and paper_author_info:
+                # Create a prompt that includes author relationship info
+                author_context = ""
+                for author_info in paper_author_info:
+                    author_context += f"Author: {author_info['name']}\n"
+                    if author_info['other_papers']:
+                        author_context += f"Other papers: {', '.join(author_info['other_papers'])}\n"
+                    if author_info['coauthors']:
+                        author_context += f"Frequent collaborators: {', '.join(author_info['coauthors'])}\n"
+                    author_context += "\n"
+
+                training_data.append({
+                    "instruction": f"Given the following information about the authors and their work, summarize the paper titled '{title}' with the abstract: {abstract}",
+                    "input": author_context,
+                    "output": full_text
+                })
+
+                # Add additional examples focused on author relationships
+                if len(paper_author_info) > 1:  # If multiple authors
+                    authors_str = ", ".join([a["name"] for a in paper_author_info])
                     training_data.append({
-                        "text": f"<section>{section_name}</section>\\n{section_text}"
+                        "instruction": f"Describe the collaboration patterns of authors {authors_str} based on their publication history.",
+                        "input": author_context,
+                        "output": f"The authors {authors_str} have collaborated on the paper '{title}'. " +
+                                  "".join([
+                                              f"{author_info['name']} has also published papers such as {', '.join(author_info['other_papers'][:3])}. "
+                                              if author_info['other_papers'] else "" for author_info in
+                                              paper_author_info]) +
+                                  "Their research focuses on topics related to " +
+                                  (abstract[:100] + "..." if len(abstract) > 100 else abstract)
                     })
             else:
-                # Fallback to basic if no sections
-                training_data.append({"text": item["text"]})
+                # Fallback if no relationship data
+                training_data.append({
+                    "instruction": f"Summarize the paper titled '{title}'",
+                    "input": abstract if abstract else "",
+                    "output": full_text
+                })
 
     # Save training data
     with open(output_json, 'w', encoding='utf-8') as f:
@@ -507,176 +642,98 @@ def create_training_json(input_json, output_json, format_type="basic"):
     return training_data
 
 
+def process_multiple_directories(input_dirs, output_file, min_length=500, include_metadata=True, include_sections=True):
+    """Process PDFs from multiple directories and combine into a single dataset."""
+    all_documents = []
+
+    # Process each directory separately
+    for dir_path in input_dirs:
+        print(f"\nProcessing directory: {dir_path}")
+
+        # Check if directory exists
+        if not os.path.isdir(dir_path):
+            print(f"Warning: Directory {dir_path} does not exist or is not accessible. Skipping.")
+            continue
+
+        # Find all PDF files in this directory
+        pdf_files = find_pdf_files(dir_path)
+
+        if not pdf_files:
+            print(f"No PDF files found in {dir_path} and its subdirectories.")
+            continue
+
+        # Process each PDF
+        print(f"Processing {len(pdf_files)} PDF files...")
+
+        for pdf_file in tqdm(pdf_files):
+            document = process_pdf(pdf_file, include_metadata, include_sections)
+
+            if document and document.get("text") and len(document["text"]) >= min_length:
+                all_documents.append(document)
+            else:
+                print(f"Skipping {pdf_file}: Text too short or extraction failed")
+
+    if not all_documents:
+        print("No valid documents were processed from any directory.")
+        return []
+
+    # Build author relationships across all documents
+    author_relationships = build_author_relationships(all_documents)
+
+    # Combine documents and relationships
+    dataset = {
+        "documents": all_documents,
+        "author_relationships": author_relationships
+    }
+
+    # Save as JSON
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+    print(f"Processed {len(all_documents)} PDFs successfully across all directories")
+    print(f"Output saved to {output_file}")
+
+    return all_documents
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Process PDF research papers recursively from directories')
-    parser.add_argument('--input', required=True, help='Input directory containing PDFs (will be searched recursively)')
+    parser = argparse.ArgumentParser(description='Enhanced PDF processor for research papers')
+    parser.add_argument('--input', nargs='+', required=True,
+                        help='One or more input directories containing PDFs (will be searched recursively)')
     parser.add_argument('--output', required=True, help='Output JSON file')
     parser.add_argument('--min_length', type=int, default=500, help='Minimum text length to include (chars)')
     parser.add_argument('--metadata', action='store_true', help='Extract and include metadata')
     parser.add_argument('--sections', action='store_true', help='Segment papers into sections')
     parser.add_argument('--training_output', help='Create training-ready JSON file')
-    parser.add_argument('--format', choices=['basic', 'instruction', 'sections'], default='basic',
-                        help='Training data format')
+    parser.add_argument('--format', choices=['basic', 'instruction', 'sections', 'relationships'],
+                        default='sections', help='Training data format')
 
     args = parser.parse_args()
 
-    # Process directory of PDFs
-    if os.path.isdir(args.input):
-        dataset = process_directory(
-            args.input, 
-            args.output, 
-            args.min_length,
-            args.metadata, 
-            args.sections
-        )
+    # Check if all input paths are directories
+    valid_dirs = []
+    for input_path in args.input:
+        if os.path.isdir(input_path):
+            valid_dirs.append(input_path)
+        else:
+            print(f"Warning: {input_path} is not a valid directory. Skipping.")
 
-        # Create training data if requested
-        if args.training_output and dataset:
-            create_training_json(args.output, args.training_output, args.format)
-    else:
-        print(f"Error: {args.input} is not a valid directory")
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-    # Save the script
-    script_path = os.path.join(output_dir, "recursive_pdf_processor.py")
-    os.makedirs(output_dir, exist_ok=True)
-
-    with open(script_path, 'w', encoding='utf-8') as f:
-        f.write(script)
-
-    print(f"PDF processor script created at {script_path}")
-    return script_path
-
-
-def process_pdf_directories(pdf_dirs, output_dir, format_type="basic"):
-    """Process PDFs from multiple directories and combine into a single dataset."""
-    # Create processing directory
-    processing_dir = os.path.join(output_dir, "processing")
-    os.makedirs(processing_dir, exist_ok=True)
-
-    # Create the PDF processor script
-    processor_script = create_pdf_processor_script(processing_dir)
-
-    # Lists to store intermediate and final JSON files
-    intermediate_jsons = []
-
-    # Process each PDF directory separately
-    for i, pdf_dir in enumerate(pdf_dirs):
-        print(f"\nProcessing directory {i + 1}/{len(pdf_dirs)}: {pdf_dir}")
-
-        # Generate paths for this directory
-        dir_basename = os.path.basename(os.path.normpath(pdf_dir))
-        # Clean up directory name for file naming
-        safe_dir_name = re.sub(r'[^\w\-_]', '_', dir_basename)
-        raw_json = os.path.join(processing_dir, f"raw_papers_{safe_dir_name}.json")
-        training_json = os.path.join(processing_dir, f"training_data_{safe_dir_name}_{format_type}.json")
-
-        # Check if directory exists
-        if not os.path.isdir(pdf_dir):
-            print(f"Warning: Directory {pdf_dir} does not exist or is not accessible. Skipping.")
-            continue
-
-        # Process PDFs in this directory
-        try:
-            subprocess.run([
-                "python", processor_script,
-                "--input", pdf_dir,
-                "--output", raw_json,
-                "--metadata",
-                "--sections",
-                "--training_output", training_json,
-                "--format", format_type
-            ], check=True)
-
-            # Add to list of intermediate JSONs
-            intermediate_jsons.append(training_json)
-        except subprocess.CalledProcessError as e:
-            print(f"Error processing directory {pdf_dir}: {e}")
-            continue
-
-    # Combine all intermediate JSONs into a single dataset
-    combined_json_path = os.path.join(output_dir, f"combined_training_data_{format_type}.json")
-
-    if not intermediate_jsons:
-        print("Error: No PDF directories were successfully processed.")
-        return None
-
-    # Combine JSON files
-    print(f"\nCombining {len(intermediate_jsons)} datasets...")
-    combined_data = []
-
-    for json_file in intermediate_jsons:
-        try:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                print(f"  - Added {len(data)} entries from {json_file}")
-                combined_data.extend(data)
-        except Exception as e:
-            print(f"Error reading {json_file}: {e}")
-
-    # Save combined dataset
-    with open(combined_json_path, 'w', encoding='utf-8') as f:
-        json.dump(combined_data, f, ensure_ascii=False, indent=2)
-
-    print(f"Combined dataset saved with {len(combined_data)} entries to {combined_json_path}")
-    return combined_json_path
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Complete workflow for fine-tuning Gemma with research papers')
-    parser.add_argument('--pdf_dirs', nargs='+', help='Multiple directories containing PDF research papers')
-    parser.add_argument('--json_path', help='Path to existing JSON dataset (if already processed)')
-    parser.add_argument('--output_dir', required=True, help='Output directory for models and scripts')
-    parser.add_argument('--model', default="google/gemma-7b", help='Gemma model ID to fine-tune')
-    parser.add_argument('--setup', action='store_true', help='Set up the environment')
-    parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
-    parser.add_argument('--format', choices=['basic', 'instruction', 'sections'], default='basic',
-                        help='Training data format')
-    parser.add_argument('--train', action='store_true', help='Run the training script')
-
-    args = parser.parse_args()
-
-    # Set up environment if requested
-    if args.setup:
-        setup_environment()
-
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Process PDFs if provided
-    if args.pdf_dirs:
-        args.json_path = process_pdf_directories(args.pdf_dirs, args.output_dir, args.format)
-
-    # Validate the dataset
-    if not args.json_path:
-        print("Error: Either --pdf_dirs or --json_path must be provided")
+    if not valid_dirs:
+        print("Error: No valid directories provided")
         return
 
-    validate_dataset(args.json_path)
-
-    # Prepare training script
-    script_path = prepare_training_script(
-        args.json_path,
-        args.output_dir,
-        model_id=args.model,
-        epochs=args.epochs
+    # Process all directories and combine results
+    documents = process_multiple_directories(
+        valid_dirs,
+        args.output,
+        args.min_length,
+        args.metadata,
+        args.sections
     )
 
-    # Prepare inference script
-    inference_path = prepare_inference_script(args.output_dir)
-
-    # Run training if requested
-    if args.train:
-        print(f"\nStarting training with {args.model}...")
-        subprocess.run(["python", script_path], check=True)
-    else:
-        print(f"\nTo start training, run: python {script_path}")
-
-    print(f"After training, you can test your model with: python {inference_path}")
+    # Create training data if requested
+    if args.training_output and documents:
+        create_training_json(args.output, args.training_output, args.format)
 
 
 if __name__ == "__main__":
