@@ -37,7 +37,7 @@ if torch.cuda.is_available():
 # Load a small sample of the dataset first to save memory
 dataset_dict = datasets.load_dataset(
     "json",
-    data_files="./trainingdata/combined_training_data_instruction.json"
+    data_files="./trainingdata/combined_publications.json"
 )
 
 # Check dataset format
@@ -213,6 +213,6 @@ except RuntimeError as e:
         sys.exit(1)
 
 # Save the fine-tuned model
-peft_model.save_pretrained("./trainingdata/final_model")
-tokenizer.save_pretrained("./trainingdata/final_model")
-print(f"Training complete. Model saved to ./trainingdata/final_model")
+peft_model.save_pretrained("./trainingdata/final_modelv2")
+tokenizer.save_pretrained("./trainingdata/final_modelv2")
+print(f"Training complete. Model saved to ./trainingdata/final_modelv2")
