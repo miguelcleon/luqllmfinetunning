@@ -1,12 +1,14 @@
 import gradio as gr
+from optimum.intel.openvino import OVModelForCausalLM
 import torch
 from peft import PeftModel, PeftConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 import os
 
 # Define paths
-MODEL_PATH = "trainingdata/final_model"  # Path to your fine-tuned model
-BASE_MODEL = "google/gemma-2b-it"  # Base model name
+OV_MODEL_DIR = "ov_model_ir"
+MODEL_PATH = "trainingdata/gemma3_luq_model"  # Path to your fine-tuned model
+BASE_MODEL = "google/gemma-3-4b-it"  # Base model name
 
 # Check for GPU availability
 use_gpu = torch.cuda.is_available()
@@ -36,6 +38,9 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 tokenizer.pad_token = tokenizer.eos_token
 
+# load the OpenVINO model (this will dispatch to CPU/GPU/NPU automatically)
+model = OVModelForCausalLM.from_pretrained(OV_MODEL_DIR)
+
 # Load LoRA weights
 print(f"Loading LoRA weights from: {MODEL_PATH}")
 model = PeftModel.from_pretrained(model, MODEL_PATH)
@@ -45,8 +50,9 @@ pipe = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
+    device=0,
     return_full_text=True,
-    max_new_tokens=512
+    max_new_tokens=1024
 )
 
 
